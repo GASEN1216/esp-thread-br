@@ -52,6 +52,8 @@
 
 static esp_openthread_platform_config_t s_openthread_platform_config;
 
+static esp_netif_t *openthread_netif;
+
 #if CONFIG_AUTO_UPDATE_RCP
 static void update_rcp(void)
 {
@@ -136,7 +138,7 @@ static void ot_br_init(void *ctx)
 #endif
     if (wifi_or_ethernet_connected) {
         esp_openthread_lock_acquire(portMAX_DELAY);
-        esp_openthread_set_backbone_netif(get_example_netif());
+        esp_openthread_set_backbone_netif(openthread_netif);
         ESP_ERROR_CHECK(esp_openthread_border_router_init());
 #if CONFIG_EXAMPLE_CONNECT_WIFI
         esp_ot_wifi_border_router_init_flag_set(true);
@@ -155,7 +157,7 @@ static void ot_br_init(void *ctx)
 static void ot_task_worker(void *ctx)
 {
     esp_netif_config_t cfg = ESP_NETIF_DEFAULT_OPENTHREAD();
-    esp_netif_t *openthread_netif = esp_netif_new(&cfg);
+    openthread_netif = esp_netif_new(&cfg);
 
     assert(openthread_netif != NULL);
 
