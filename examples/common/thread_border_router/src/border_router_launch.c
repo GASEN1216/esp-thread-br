@@ -65,6 +65,73 @@ ESP_EVENT_DEFINE_BASE(HYP_OTBR_EVENT);
 static esp_openthread_platform_config_t s_openthread_platform_config;
 
 static esp_netif_t *openthread_netif;
+static bool s_otbr_ready_reported;
+
+static bool is_thread_role_attached(otDeviceRole role)
+{
+    return (role == OT_DEVICE_ROLE_CHILD) ||
+           (role == OT_DEVICE_ROLE_ROUTER) ||
+           (role == OT_DEVICE_ROLE_LEADER);
+}
+
+static bool is_otbr_operational(otInstance *instance)
+{
+    otBorderRoutingState br_state;
+    otDeviceRole role;
+
+    if (instance == NULL) {
+        return false;
+    }
+
+    role = otThreadGetDeviceRole(instance);
+    br_state = otBorderRoutingGetState(instance);
+
+    return otIp6IsEnabled(instance) &&
+           is_thread_role_attached(role) &&
+           (br_state == OT_BORDER_ROUTING_STATE_RUNNING);
+}
+
+static void post_otbr_state_if_changed(bool ready, const char *reason)
+{
+    int32_t event_id = ready ? HYP_OTBR_EVENT_READY : HYP_OTBR_EVENT_NOT_READY;
+
+    if (ready == s_otbr_ready_reported) {
+        return;
+    }
+
+    s_otbr_ready_reported = ready;
+    ESP_LOGI(TAG,
+             "OpenThread BR state changed: %s (%s)",
+             ready ? "ready" : "not ready",
+             reason ? reason : "no reason");
+
+    if (esp_event_post(HYP_OTBR_EVENT, event_id, NULL, 0, 0) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to post OpenThread BR %s event", ready ? "ready" : "not ready");
+    }
+}
+
+static void report_otbr_state(otInstance *instance, const char *reason)
+{
+    post_otbr_state_if_changed(is_otbr_operational(instance), reason);
+}
+
+static void otbr_state_changed_callback(otChangedFlags changed_flags, void *ctx)
+{
+    otInstance *instance = esp_openthread_get_instance();
+
+    OT_UNUSED_VARIABLE(ctx);
+
+    if (instance == NULL) {
+        return;
+    }
+
+    if (changed_flags & (OT_CHANGED_THREAD_ROLE |
+                         OT_CHANGED_THREAD_NETIF_STATE |
+                         OT_CHANGED_THREAD_BACKBONE_ROUTER_STATE |
+                         OT_CHANGED_THREAD_NETDATA)) {
+        report_otbr_state(instance, "state-changed callback");
+    }
+}
 
 #if CONFIG_AUTO_UPDATE_RCP
 #define HYP_RCP_RECOVERY_PENDING_KEY "h2_rec"
@@ -411,16 +478,17 @@ static void ot_br_init(void *ctx)
 #endif
 #if CONFIG_OPENTHREAD_BR_AUTO_START
     // Start OpenThread Border Router without blocking on any specific backhaul.
-    // Whichever uplink (Wi‑Fi / Ethernet / PPP) becomes available will be used by the system.
+    // Whichever uplink (Wi‐Fi / Ethernet / PPP) becomes available will be used by the system.
     esp_openthread_lock_acquire(portMAX_DELAY);
     esp_openthread_set_backbone_netif(openthread_netif);
     ESP_ERROR_CHECK(esp_openthread_border_router_init());
     otOperationalDatasetTlvs dataset;
+    otInstance *instance = esp_openthread_get_instance();
     otError error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
     ESP_ERROR_CHECK(esp_openthread_auto_start((error == OT_ERROR_NONE) ? &dataset : NULL));
+    report_otbr_state(instance, "auto-start");
     esp_openthread_lock_release();
     ESP_LOGI(TAG, "OpenThread BR auto-started; backhaul will use whichever interface gets IP first");
-    ESP_ERROR_CHECK(esp_event_post(HYP_OTBR_EVENT, HYP_OTBR_EVENT_READY, NULL, 0, portMAX_DELAY));
 
     // Ethernet backhaul is owned by the application backhaul manager.
     // Do not implicitly start it here, or OTBR may take over child devices
@@ -437,6 +505,7 @@ static void ot_task_worker(void *ctx)
 {
     esp_netif_config_t cfg = ESP_NETIF_DEFAULT_OPENTHREAD();
     openthread_netif = esp_netif_new(&cfg);
+    s_otbr_ready_reported = false;
 
     assert(openthread_netif != NULL);
 
@@ -456,6 +525,9 @@ static void ot_task_worker(void *ctx)
 #if CONFIG_AUTO_UPDATE_RCP
     try_update_ot_rcp();
 #endif
+    ESP_ERROR_CHECK(otSetStateChangedCallback(esp_openthread_get_instance(),
+                                              otbr_state_changed_callback,
+                                              NULL) == OT_ERROR_NONE ? ESP_OK : ESP_FAIL);
     // Initialize border routing features
     esp_openthread_lock_acquire(portMAX_DELAY);
     ESP_ERROR_CHECK(esp_netif_attach(openthread_netif, esp_openthread_netif_glue_init(&s_openthread_platform_config)));
@@ -475,6 +547,7 @@ static void ot_task_worker(void *ctx)
                                 NULL, 4, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     // Run the main loop
     esp_openthread_launch_mainloop();
+    post_otbr_state_if_changed(false, "mainloop exit");
 
     // Clean up
     esp_openthread_netif_glue_deinit();
