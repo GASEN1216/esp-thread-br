@@ -94,20 +94,24 @@ static bool is_otbr_operational(otInstance *instance)
 static void post_otbr_state_if_changed(bool ready, const char *reason)
 {
     int32_t event_id = ready ? HYP_OTBR_EVENT_READY : HYP_OTBR_EVENT_NOT_READY;
+    esp_err_t err;
 
     if (ready == s_otbr_ready_reported) {
         return;
     }
 
-    s_otbr_ready_reported = ready;
     ESP_LOGI(TAG,
              "OpenThread BR state changed: %s (%s)",
              ready ? "ready" : "not ready",
              reason ? reason : "no reason");
 
-    if (esp_event_post(HYP_OTBR_EVENT, event_id, NULL, 0, 0) != ESP_OK) {
+    err = esp_event_post(HYP_OTBR_EVENT, event_id, NULL, 0, portMAX_DELAY);
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to post OpenThread BR %s event", ready ? "ready" : "not ready");
+        return;
     }
+
+    s_otbr_ready_reported = ready;
 }
 
 static void report_otbr_state(otInstance *instance, const char *reason)
