@@ -36,6 +36,7 @@
 #include "freertos/task.h"
 #include "openthread/backbone_router_ftd.h"
 #include "openthread/border_router.h"
+#include "openthread/border_routing.h"
 #include "openthread/cli.h"
 #include "openthread/dataset_ftd.h"
 #include "openthread/error.h"
