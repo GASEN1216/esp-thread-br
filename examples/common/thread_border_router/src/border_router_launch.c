@@ -77,7 +77,6 @@ static bool is_thread_role_attached(otDeviceRole role)
 
 static bool is_otbr_operational(otInstance *instance)
 {
-    otBorderRoutingState br_state;
     otDeviceRole role;
 
     if (instance == NULL) {
@@ -85,11 +84,16 @@ static bool is_otbr_operational(otInstance *instance)
     }
 
     role = otThreadGetDeviceRole(instance);
-    br_state = otBorderRoutingGetState(instance);
 
+    /*
+     * The application services gated by HYP_OTBR_EVENT_READY are local Thread
+     * services such as CoAP. They require the OT interface to be up and attached,
+     * while border-routing RUNNING can lag or stay unavailable depending on the
+     * backhaul runtime. Requiring border routing here can leave CoAP/log services
+     * deferred even after the device has become a Thread router/leader.
+     */
     return otIp6IsEnabled(instance) &&
-           is_thread_role_attached(role) &&
-           (br_state == OT_BORDER_ROUTING_STATE_RUNNING);
+           is_thread_role_attached(role);
 }
 
 static void post_otbr_state_if_changed(bool ready, const char *reason)
