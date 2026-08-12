@@ -66,7 +66,9 @@ ESP_EVENT_DEFINE_BASE(HYP_OTBR_EVENT);
 static esp_openthread_platform_config_t s_openthread_platform_config;
 
 static esp_netif_t *openthread_netif;
+static bool s_ot_init_ready_reported;
 static bool s_otbr_ready_reported;
+static bool s_ot_parent_ready_reported;
 
 static bool is_thread_role_attached(otDeviceRole role)
 {
@@ -96,32 +98,100 @@ static bool is_otbr_operational(otInstance *instance)
            is_thread_role_attached(role);
 }
 
-static void post_otbr_state_if_changed(bool ready, const char *reason)
+static bool is_ot_parent_operational(otInstance *instance)
 {
-    int32_t event_id = ready ? HYP_OTBR_EVENT_READY : HYP_OTBR_EVENT_NOT_READY;
+    otDeviceRole role;
+
+    if (instance == NULL || !otIp6IsEnabled(instance)) {
+        return false;
+    }
+
+    role = otThreadGetDeviceRole(instance);
+    return (role == OT_DEVICE_ROLE_ROUTER) || (role == OT_DEVICE_ROLE_LEADER);
+}
+
+static hyp_otbr_state_event_t get_otbr_state(otInstance *instance)
+{
+    hyp_otbr_state_event_t state = {
+        .role = OT_DEVICE_ROLE_DISABLED,
+        .ip6_enabled = false,
+    };
+
+    if (instance != NULL) {
+        state.role = otThreadGetDeviceRole(instance);
+        state.ip6_enabled = otIp6IsEnabled(instance);
+    }
+
+    return state;
+}
+
+static bool post_otbr_event(int32_t event_id, otInstance *instance, const char *name, const char *reason)
+{
+    hyp_otbr_state_event_t state = get_otbr_state(instance);
     esp_err_t err;
 
+    ESP_LOGI(TAG,
+             "OpenThread state: %s, IPv6=%s, role=%d (%s)",
+             name,
+             state.ip6_enabled ? "enabled" : "disabled",
+             (int)state.role,
+             reason ? reason : "no reason");
+
+    err = esp_event_post(HYP_OTBR_EVENT, event_id, &state, sizeof(state), portMAX_DELAY);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to post OpenThread %s event: %s", name, esp_err_to_name(err));
+        return false;
+    }
+
+    return true;
+}
+
+static void post_ot_init_state_if_changed(bool ready, otInstance *instance, const char *reason)
+{
+    if (ready == s_ot_init_ready_reported) {
+        return;
+    }
+
+    if (post_otbr_event(ready ? HYP_OTBR_EVENT_INIT_READY : HYP_OTBR_EVENT_INIT_NOT_READY,
+                        instance,
+                        ready ? "init-ready" : "init-not-ready",
+                        reason)) {
+        s_ot_init_ready_reported = ready;
+    }
+}
+
+static void post_otbr_state_if_changed(bool ready, otInstance *instance, const char *reason)
+{
     if (ready == s_otbr_ready_reported) {
         return;
     }
 
-    ESP_LOGI(TAG,
-             "OpenThread BR state changed: %s (%s)",
-             ready ? "ready" : "not ready",
-             reason ? reason : "no reason");
+    if (post_otbr_event(ready ? HYP_OTBR_EVENT_READY : HYP_OTBR_EVENT_NOT_READY,
+                        instance,
+                        ready ? "attached-ready" : "attached-not-ready",
+                        reason)) {
+        s_otbr_ready_reported = ready;
+    }
+}
 
-    err = esp_event_post(HYP_OTBR_EVENT, event_id, NULL, 0, portMAX_DELAY);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to post OpenThread BR %s event", ready ? "ready" : "not ready");
+static void post_ot_parent_state_if_changed(bool ready, otInstance *instance, const char *reason)
+{
+    if (ready == s_ot_parent_ready_reported) {
         return;
     }
 
-    s_otbr_ready_reported = ready;
+    if (post_otbr_event(ready ? HYP_OTBR_EVENT_PARENT_READY : HYP_OTBR_EVENT_PARENT_NOT_READY,
+                        instance,
+                        ready ? "parent-ready" : "parent-not-ready",
+                        reason)) {
+        s_ot_parent_ready_reported = ready;
+    }
 }
 
 static void report_otbr_state(otInstance *instance, const char *reason)
 {
-    post_otbr_state_if_changed(is_otbr_operational(instance), reason);
+    post_otbr_state_if_changed(is_otbr_operational(instance), instance, reason);
+    post_ot_parent_state_if_changed(is_ot_parent_operational(instance), instance, reason);
 }
 
 static void otbr_state_changed_callback(otChangedFlags changed_flags, void *ctx)
@@ -495,6 +565,10 @@ static void ot_br_init(void *ctx)
     otInstance *instance = esp_openthread_get_instance();
     otError error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
     ESP_ERROR_CHECK(esp_openthread_auto_start((error == OT_ERROR_NONE) ? &dataset : NULL));
+    post_otbr_event(HYP_OTBR_EVENT_AUTO_START_READY,
+                    instance,
+                    "auto-start-ready",
+                    "esp_openthread_auto_start returned ESP_OK");
     report_otbr_state(instance, "auto-start");
     esp_openthread_lock_release();
     ESP_LOGI(TAG, "OpenThread BR auto-started; backhaul will use whichever interface gets IP first");
@@ -514,7 +588,9 @@ static void ot_task_worker(void *ctx)
 {
     esp_netif_config_t cfg = ESP_NETIF_DEFAULT_OPENTHREAD();
     openthread_netif = esp_netif_new(&cfg);
+    s_ot_init_ready_reported = false;
     s_otbr_ready_reported = false;
+    s_ot_parent_ready_reported = false;
 
     assert(openthread_netif != NULL);
 
@@ -534,6 +610,9 @@ static void ot_task_worker(void *ctx)
 #if CONFIG_AUTO_UPDATE_RCP
     try_update_ot_rcp();
 #endif
+    post_ot_init_state_if_changed(true,
+                                  esp_openthread_get_instance(),
+                                  "esp_openthread_init returned ESP_OK and RCP recovery was not requested");
     ESP_ERROR_CHECK(otSetStateChangedCallback(esp_openthread_get_instance(),
                                               otbr_state_changed_callback,
                                               NULL) == OT_ERROR_NONE ? ESP_OK : ESP_FAIL);
@@ -556,7 +635,9 @@ static void ot_task_worker(void *ctx)
                                 NULL, 4, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     // Run the main loop
     esp_openthread_launch_mainloop();
-    post_otbr_state_if_changed(false, "mainloop exit");
+    post_ot_parent_state_if_changed(false, esp_openthread_get_instance(), "mainloop exit");
+    post_otbr_state_if_changed(false, esp_openthread_get_instance(), "mainloop exit");
+    post_ot_init_state_if_changed(false, esp_openthread_get_instance(), "mainloop exit");
 
     // Clean up
     esp_openthread_netif_glue_deinit();

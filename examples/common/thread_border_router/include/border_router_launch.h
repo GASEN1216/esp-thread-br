@@ -17,13 +17,24 @@ extern "C" {
 #include "esp_openthread.h"
 #include "esp_openthread_border_router.h"
 #include "esp_rcp_update.h"
+#include "openthread/thread.h"
 
 ESP_EVENT_DECLARE_BASE(HYP_OTBR_EVENT);
 
 typedef enum {
     HYP_OTBR_EVENT_READY = 1,
     HYP_OTBR_EVENT_NOT_READY,
+    HYP_OTBR_EVENT_INIT_READY,
+    HYP_OTBR_EVENT_INIT_NOT_READY,
+    HYP_OTBR_EVENT_AUTO_START_READY,
+    HYP_OTBR_EVENT_PARENT_READY,
+    HYP_OTBR_EVENT_PARENT_NOT_READY,
 } hyp_otbr_event_id_t;
+
+typedef struct {
+    otDeviceRole role;
+    bool ip6_enabled;
+} hyp_otbr_state_event_t;
 
 void launch_openthread_border_router(const esp_openthread_platform_config_t *config,
                                      const esp_rcp_update_config_t *update_config);
