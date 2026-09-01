@@ -666,6 +666,11 @@ void launch_openthread_border_router(const esp_openthread_platform_config_t *pla
     OT_UNUSED_VARIABLE(update_config);
 #endif
 
+    /* Honour CONFIG_OPENTHREAD_TASK_PRIORITY instead of a hardcoded 5. The BR
+     * builds its own mainloop task here rather than going through
+     * esp_openthread_start(), which was the only consumer of that Kconfig entry,
+     * so the setting had no effect on this path. The stack size stays explicit. */
     ESP_ERROR_CHECK(xTaskCreate(ot_task_worker, "ot_br_main", 8192,
-                                xTaskGetCurrentTaskHandle(), 5, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+                                xTaskGetCurrentTaskHandle(),
+                                CONFIG_OPENTHREAD_TASK_PRIORITY, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }
