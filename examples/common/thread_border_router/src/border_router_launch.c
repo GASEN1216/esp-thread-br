@@ -24,6 +24,7 @@
 #include "esp_openthread_spinel.h"
 #include "esp_openthread_types.h"
 #if CONFIG_AUTO_UPDATE_RCP
+#include "esp_ota_ops.h"
 #include "esp_rcp_firmware.h"
 #endif
 #include "esp_system.h"
@@ -298,6 +299,81 @@ static void save_confirmed_rcp_version(const char *version)
     nvs_close(handle);
 }
 
+/* F-RCP-002: never restart out from under a pending OTA verification.
+ *
+ * The first boot after a gateway OTA runs with the new image in
+ * ESP_OTA_IMG_PENDING_VERIFY, and that image is marked valid only when the OTA
+ * agent gets the answer to its boot-time StartNext back from AWS
+ * (otaPal_SetPlatformImageState -> ESP_OTA_IMG_VALID). Nothing else in the
+ * firmware clears the pending state.
+ *
+ * Every restart in this file races that. The first boot after an update always
+ * reflashes the H2, because the bundled RCP version no longer matches the one
+ * confirmed in NVS (and gateways flashed before 2026-06-24 have never written a
+ * confirmed version at all), and the reflash finishes in tens of seconds while
+ * the StartNext answer travels over a cellular backhaul where it can be lost
+ * outright and re-driven by the job-check watchdog. Restarting first makes the
+ * bootloader roll the gateway back onto the firmware it just replaced, and that
+ * firmware then re-downloads the same 3 MB image on its next boot - invisibly,
+ * because pre-F-OTA-009 firmware cannot report a failed job.
+ *
+ * So wait for the verification to resolve first. A restart after the timeout is
+ * exactly the old behaviour and does roll back, which is the correct outcome
+ * when the cloud never confirms the update. A running image that is not pending
+ * verification - every normal boot, and every factory-fresh unit - returns
+ * immediately, so nothing else changes.
+ *
+ * Task context: all callers run on internal-RAM stacks (h2_rcp_recovery,
+ * ot_br_start, ot_br_main), which is required because reading the image state
+ * touches the otadata partition. */
+#define HYP_RCP_RESTART_OTA_WAIT_MS 600000
+#define HYP_RCP_RESTART_OTA_POLL_MS 1000
+#define HYP_RCP_RESTART_OTA_LOG_EVERY_MS 30000
+
+static void wait_for_pending_ota_verification(const char *reason)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_VALID;
+    uint32_t waited_ms = 0;
+
+    if (running == NULL || esp_ota_get_state_partition(running, &state) != ESP_OK) {
+        return;
+    }
+
+    if (state != ESP_OTA_IMG_PENDING_VERIFY) {
+        return;
+    }
+
+    ESP_LOGW(TAG,
+             "%s, but the running OTA image is still pending verification; waiting up to %d s "
+             "so the restart cannot roll the update back",
+             reason ? reason : "Restart requested", HYP_RCP_RESTART_OTA_WAIT_MS / 1000);
+
+    while (waited_ms < HYP_RCP_RESTART_OTA_WAIT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(HYP_RCP_RESTART_OTA_POLL_MS));
+        waited_ms += HYP_RCP_RESTART_OTA_POLL_MS;
+
+        if (esp_ota_get_state_partition(running, &state) != ESP_OK) {
+            return;
+        }
+
+        if (state != ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGI(TAG, "OTA image validated after %lu s; restarting now",
+                     (unsigned long)(waited_ms / 1000));
+            return;
+        }
+
+        if ((waited_ms % HYP_RCP_RESTART_OTA_LOG_EVERY_MS) == 0) {
+            ESP_LOGW(TAG, "Still waiting for the OTA image to be validated (%lu s)",
+                     (unsigned long)(waited_ms / 1000));
+        }
+    }
+
+    ESP_LOGE(TAG, "OTA image was not validated within %d s; restarting anyway - the bootloader "
+                  "will roll back to the previous firmware",
+             HYP_RCP_RESTART_OTA_WAIT_MS / 1000);
+}
+
 static void request_rcp_recovery_restart(const char *reason)
 {
     if (s_rcp_recovery_restart_requested) {
@@ -307,6 +383,7 @@ static void request_rcp_recovery_restart(const char *reason)
     s_rcp_recovery_restart_requested = true;
     ESP_LOGE(TAG, "H2 RCP recovery requested: %s", reason ? reason : "unknown reason");
     set_rcp_recovery_pending(true);
+    wait_for_pending_ota_verification("H2 RCP recovery needs a restart");
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
     vTaskDelay(portMAX_DELAY);
@@ -493,6 +570,8 @@ static void rcp_recovery_task(void *ctx)
             esp_rcp_mark_image_verified(true);
             save_confirmed_rcp_version(internal_version);
             set_rcp_recovery_pending(false);
+            /* F-RCP-002 */
+            wait_for_pending_ota_verification("H2 RCP recovery finished");
             vTaskDelay(pdMS_TO_TICKS(300));
             esp_restart();
         }
